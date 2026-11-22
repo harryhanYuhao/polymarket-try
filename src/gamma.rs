@@ -1,6 +1,9 @@
 //! Gamma API (`gamma-api.polymarket.com`): prediction-market metadata.
+//! ProxyWallet address is also found by gamma api
 
-use crate::http::{de, read_json};
+use crate::eth::parse_address;
+use crate::http::{de, is_not_found, read_json};
+use alloy_primitives::Address;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +76,12 @@ struct SearchEvent {
     markets: Option<Vec<GammaMarket>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ProxyWalletAddress {
+    #[serde(rename = "proxyWallet")]
+    proxy_wallet: Option<String>,
+}
+
 pub struct GammaClient {
     http: reqwest::Client,
     base_url: String,
@@ -141,6 +150,37 @@ impl GammaClient {
         markets.truncate(limit);
         Ok(markets)
     }
+
+    pub async fn proxy_wallet(&self, owner: Address) -> Result<Option<Address>> {
+        let response = self
+            .http
+            .get(format!("{}/public-profile", self.base_url))
+            .query(&[("address", owner.to_string())])
+            .send()
+            .await
+            .context("GET /public-profile")?;
+
+        let address: ProxyWalletAddress = match read_json("Gamma", response).await {
+            Ok(p) => p,
+            Err(e) => {
+                if is_not_found(&e) {
+                    return Ok(None);
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+
+        if let Some(raw) = address.proxy_wallet.filter(|s| !s.trim().is_empty()) {
+            let wallet = parse_address(&raw).context("Gamma public-profile: proxyWallet")?;
+            if wallet.is_zero() {
+                return Ok(None);
+            }
+            Ok(Some(wallet))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -156,5 +196,97 @@ mod tests {
         .unwrap();
         assert_eq!(m.outcome_summary(), "Yes 0.73 · No 0.27");
         assert_eq!(m.volume_24hr.as_deref(), Some("1234.5"));
+    }
+
+    mod proxy_wallet {
+        use super::*;
+        use alloy_primitives::address;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const OWNER: Address = address!("92231F8A8F2dd481e1c58E535f8b9C37E323524b");
+        const WALLET: Address = address!("bc7afbcd28f5e5e95156f9c8e9e48da5212e07de");
+
+        /// Look up `OWNER` against a Gamma mock answering `status` with `body`.
+        async fn lookup(status: u16, body: serde_json::Value) -> Result<Option<Address>> {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/public-profile"))
+                .and(query_param("address", OWNER.to_string()))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            GammaClient::new(reqwest::Client::new(), server.uri())
+                .proxy_wallet(OWNER)
+                .await
+        }
+
+        #[tokio::test]
+        async fn returns_the_profile_wallet() {
+            let found = lookup(
+                200,
+                serde_json::json!({"proxyWallet": WALLET.to_string().to_lowercase(), "name": "x"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(found, Some(WALLET));
+        }
+
+        #[tokio::test]
+        async fn unknown_profile_is_none() {
+            let found = lookup(
+                404,
+                serde_json::json!({"type": "not found error", "error": "profile not found"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(found, None);
+        }
+
+        #[tokio::test]
+        async fn missing_or_null_wallet_is_none() {
+            assert_eq!(lookup(200, serde_json::json!({})).await.unwrap(), None);
+            assert_eq!(
+                lookup(200, serde_json::json!({"proxyWallet": null}))
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn empty_wallet_is_none() {
+            let found = lookup(200, serde_json::json!({"proxyWallet": ""})).await;
+            assert_eq!(found.unwrap(), None);
+        }
+
+        #[tokio::test]
+        async fn zero_wallet_is_none() {
+            let found = lookup(
+                200,
+                serde_json::json!({"proxyWallet": Address::ZERO.to_string()}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(found, None);
+        }
+
+        #[tokio::test]
+        async fn malformed_wallet_is_an_error() {
+            let err = lookup(200, serde_json::json!({"proxyWallet": "nonsense"}))
+                .await
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("proxyWallet"), "{err:#}");
+        }
+
+        #[tokio::test]
+        async fn server_error_is_an_error() {
+            let err = lookup(500, serde_json::json!({"error": "boom"}))
+                .await
+                .unwrap_err();
+            assert!(!crate::http::is_not_found(&err));
+            assert!(format!("{err:#}").contains("boom"), "{err:#}");
+        }
     }
 }

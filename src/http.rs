@@ -74,6 +74,11 @@ fn error_message(body: &str) -> String {
     }
 }
 
+pub fn is_not_found(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<ApiError>()
+        .is_some_and(|api| api.status == StatusCode::NOT_FOUND)
+}
+
 pub fn truncate(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         text.to_string()
@@ -111,5 +116,29 @@ pub mod de {
     /// Like [`opt_string_any`] but falls back to an empty string.
     pub fn string_any<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
         Ok(opt_string_any(d)?.unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api_error(status: StatusCode) -> anyhow::Error {
+        ApiError {
+            api: "Gamma",
+            status,
+            message: "x".into(),
+        }
+        .into()
+    }
+
+    #[test]
+    fn is_not_found_matches_only_404_api_errors() {
+        assert!(is_not_found(&api_error(StatusCode::NOT_FOUND)));
+        assert!(is_not_found(
+            &api_error(StatusCode::NOT_FOUND).context("GET /public-profile")
+        ));
+        assert!(!is_not_found(&api_error(StatusCode::INTERNAL_SERVER_ERROR)));
+        assert!(!is_not_found(&anyhow!("not found")));
     }
 }

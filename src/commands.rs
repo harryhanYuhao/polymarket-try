@@ -8,6 +8,7 @@ use crate::output::{
     align_right, dec, ellipsize, heading, num, print_json, short_id, signed, table, timestamp_text,
     unix_secs,
 };
+use alloy_primitives::Address;
 use anyhow::{bail, Context, Result};
 use pm_try::clob::{ClobClient, ClobOrder, OrderFilter};
 use pm_try::config::{Config, MissingCredentials};
@@ -446,6 +447,35 @@ async fn prediction_markets(ctx: &Ctx, search: Option<String>, limit: usize) -> 
     })
 }
 
+async fn lookup_wallet(ctx: &Ctx, signer: Address) -> Option<Address> {
+    let found = match ctx.gamma().proxy_wallet(signer).await {
+        Ok(Some(wallet)) => wallet,
+        Ok(None) => {
+            eprintln!(
+                "note: no Polymarket profile found for {signer}; \
+            set PM_WALLET to you Polymarket (proxy) wallet manually"
+            );
+            return None;
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: could not look up your polymarket proxy wallet address ({e:#})\
+                set PM_WALLET manually"
+            );
+            return None;
+        }
+    };
+    if let Some(current) = ctx.cfg.wallet {
+        if current != found {
+            eprintln!(
+            "warning: PM_WALLET is {current}, but the wallet registered to {signer} is {found}; using {found}.\
+This is possible as polymarket now defaults to use proxy wallet"
+            );
+        }
+    }
+    Some(found)
+}
+
 async fn api_key(ctx: &Ctx, create: bool, nonce: u64, out: Option<&Path>) -> Result<()> {
     let owner = ctx.cfg.owner_signer("prediction")?;
     let clob = ctx.clob();
@@ -456,17 +486,18 @@ async fn api_key(ctx: &Ctx, create: bool, nonce: u64, out: Option<&Path>) -> Res
             .await
             .context("could not derive an existing API key (use --create to make one)")?
     };
-    emit_env(
-        ctx,
-        &[
-            ("PM_ADDRESS", owner.address().to_string()),
-            ("PM_CLOB_API_KEY", creds.api_key),
-            ("PM_CLOB_SECRET", creds.secret),
-            ("PM_CLOB_PASSPHRASE", creds.passphrase),
-        ],
-        out,
-        "CLOB API credentials",
-    )
+
+    let mut vars = vec![
+        ("PM_ADDRESS", owner.address().to_string()),
+        ("PM_CLOB_API_KEY", creds.api_key),
+        ("PM_CLOB_SECRET", creds.secret),
+        ("PM_CLOB_PASSPHRASE", creds.passphrase),
+    ];
+    if let Some(wallet) = lookup_wallet(ctx, owner.address()).await {
+        vars.push(("PM_WALLET", wallet.to_string()));
+    }
+
+    emit_env(ctx, &vars, out, "CLOB API credentials")
 }
 
 // ---------------------------------------------------------------------------

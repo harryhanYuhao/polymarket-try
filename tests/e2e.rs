@@ -677,3 +677,180 @@ async fn http_5xx_on_create_is_reported_as_unknown() {
     );
     assert!(!err.contains("was rejected"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// prediction api-key: PM_WALLET lookup
+// ---------------------------------------------------------------------------
+
+/// The profile wallet, as `pm` prints it (EIP-55 checksummed).
+fn wallet() -> String {
+    "0xbc7afbcd28f5e5e95156f9c8e9e48da5212e07de"
+        .parse::<Address>()
+        .unwrap()
+        .to_string()
+}
+
+fn owner_address() -> Address {
+    LocalSigner::from_hex(OWNER_KEY).unwrap().address()
+}
+
+/// Mock the CLOB key derivation and a Gamma profile lookup for the owner
+/// that answers `status` with `body`.
+async fn mount_api_key(server: &MockServer, status: u16, body: Value) {
+    Mock::given(method("GET"))
+        .and(path("/auth/derive-api-key"))
+        .respond_with(ok(json!({
+            "apiKey": "test-key",
+            "secret": CLOB_SECRET,
+            "passphrase": "test-pass",
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/public-profile"))
+        .and(query_param("address", owner_address().to_string()))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// Every stdout line is `KEY=value`, so the output can be piped into `.env`.
+fn assert_env_lines(out: &Output) {
+    for line in stdout(out).lines() {
+        assert!(
+            line.split_once('=')
+                .is_some_and(|(k, _)| k.starts_with("PM_")),
+            "non-env line on stdout: {line:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_emits_wallet_from_profile() {
+    let server = MockServer::start().await;
+    mount_api_key(
+        &server,
+        200,
+        json!({"proxyWallet": wallet().to_lowercase()}),
+    )
+    .await;
+
+    let out = pm(
+        &server,
+        &[("PM_PRIVATE_KEY", OWNER_KEY)],
+        &["prediction", "api-key"],
+    )
+    .await;
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_env_lines(&out);
+    let text = stdout(&out);
+    assert!(text.contains("PM_CLOB_API_KEY=test-key"), "{text}");
+    assert!(text.contains(&format!("PM_WALLET={}", wallet())), "{text}");
+    let err = stderr(&out);
+    assert!(!err.contains("warning"), "{err}");
+    assert!(!err.contains("note:"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_without_profile_still_emits_credentials() {
+    let server = MockServer::start().await;
+    mount_api_key(&server, 404, json!({"error": "profile not found"})).await;
+
+    let out = pm(
+        &server,
+        &[("PM_PRIVATE_KEY", OWNER_KEY)],
+        &["prediction", "api-key"],
+    )
+    .await;
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_env_lines(&out);
+    let text = stdout(&out);
+    assert!(text.contains("PM_CLOB_SECRET="), "{text}");
+    assert!(!text.contains("PM_WALLET"), "{text}");
+    assert!(
+        stderr(&out).contains("no Polymarket profile"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_survives_failed_lookup() {
+    let server = MockServer::start().await;
+    mount_api_key(&server, 500, json!({"error": "gamma down"})).await;
+
+    let out = pm(
+        &server,
+        &[("PM_PRIVATE_KEY", OWNER_KEY)],
+        &["prediction", "api-key"],
+    )
+    .await;
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_env_lines(&out);
+    let text = stdout(&out);
+    assert!(text.contains("PM_CLOB_PASSPHRASE=test-pass"), "{text}");
+    assert!(!text.contains("PM_WALLET"), "{text}");
+    let err = stderr(&out);
+    assert!(err.contains("warning"), "{err}");
+    assert!(err.contains("gamma down"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_warns_when_pm_wallet_differs() {
+    let server = MockServer::start().await;
+    mount_api_key(&server, 200, json!({"proxyWallet": wallet()})).await;
+
+    let stale = "0x0000000000000000000000000000000000000001";
+    let out = pm(
+        &server,
+        &[("PM_PRIVATE_KEY", OWNER_KEY), ("PM_WALLET", stale)],
+        &["prediction", "api-key"],
+    )
+    .await;
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains(&format!("PM_WALLET={}", wallet())));
+    let err = stderr(&out);
+    assert!(err.contains("warning"), "{err}");
+    assert!(err.contains(stale) && err.contains(&wallet()), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_json_includes_wallet() {
+    let server = MockServer::start().await;
+    mount_api_key(&server, 200, json!({"proxyWallet": wallet()})).await;
+
+    let out = pm(
+        &server,
+        &[("PM_PRIVATE_KEY", OWNER_KEY)],
+        &["--json", "prediction", "api-key"],
+    )
+    .await;
+    assert!(out.status.success(), "{}", stderr(&out));
+    let v: Value = serde_json::from_str(&stdout(&out)).expect("stdout is JSON");
+    assert_eq!(v["PM_WALLET"], wallet());
+    assert_eq!(v["PM_CLOB_API_KEY"], "test-key");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_out_keeps_existing_wallet_when_lookup_fails() {
+    let server = MockServer::start().await;
+    mount_api_key(&server, 500, json!({"error": "gamma down"})).await;
+
+    let env_file = std::env::temp_dir().join(format!("pm-e2e-out-{}.env", std::process::id()));
+    std::fs::write(&env_file, format!("PM_WALLET={}\n", wallet())).unwrap();
+    let out = pm(
+        &server,
+        &[("PM_PRIVATE_KEY", OWNER_KEY)],
+        &["prediction", "api-key", "--out", env_file.to_str().unwrap()],
+    )
+    .await;
+    assert!(out.status.success(), "{}", stderr(&out));
+    let saved = std::fs::read_to_string(&env_file).unwrap();
+    std::fs::remove_file(&env_file).ok();
+    assert!(
+        saved.contains(&format!("PM_WALLET={}", wallet())),
+        "{saved}"
+    );
+    assert!(saved.contains("PM_CLOB_API_KEY=test-key"), "{saved}");
+}
