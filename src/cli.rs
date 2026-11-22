@@ -1,189 +1,296 @@
-//! Command-line interface definitions.
+//! Command-line interface definition (clap derive).
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use pm_try::config::ENV_HELP;
+use std::path::PathBuf;
 
-#[derive(Debug, Parser)]
+#[derive(Parser, Debug)]
 #[command(
-    name = "pml",
-    about = "Query Polymarket prediction-market and Perps accounts, and manage Perps TP/SL",
+    name = "pm",
     version,
-    propagate_version = true
+    about = "Polymarket CLI: active orders and positions across prediction markets and perps, \
+             plus perps take-profit / stop-loss management",
+    after_help = ENV_HELP
 )]
 pub struct Cli {
-    /// Emit machine-readable JSON instead of tables.
-    #[arg(long, global = true)]
+    /// Print JSON instead of tables
+    #[arg(long, global = true, display_order = 100)]
     pub json: bool,
 
-    /// CLOB base URL (defaults to https://clob.polymarket.com).
-    #[arg(long, global = true, env = "POLYMARKET_CLOB_URL")]
-    pub clob_url: Option<String>,
-
-    /// Perps base URL (defaults to https://api.perpetuals.polymarket.com).
-    #[arg(long, global = true, env = "POLYMARKET_PERPS_URL")]
-    pub perps_url: Option<String>,
-
-    /// Data API base URL (defaults to https://data-api.polymarket.com).
-    #[arg(long, global = true, env = "POLYMARKET_DATA_API_URL")]
-    pub data_api_url: Option<String>,
+    /// Load environment variables from this file (default: ./.env when present)
+    #[arg(long, global = true, value_name = "PATH", display_order = 101)]
+    pub env_file: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Command,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Create, inspect, or validate authentication credentials.
-    Auth {
-        #[command(subcommand)]
-        command: AuthCommand,
-    },
-
-    /// List active orders.
+    /// Active orders on prediction markets and perps
     Orders(OrdersArgs),
-
-    /// List open positions.
+    /// Open positions on prediction markets and perps
     Positions(PositionsArgs),
-
-    /// Perpetuals market data, orders, and TP/SL management.
-    Perps {
-        #[command(subcommand)]
-        command: PerpsCommand,
-    },
+    /// Prediction markets (CLOB, Data API, Gamma)
+    #[command(subcommand, visible_alias = "pred")]
+    Prediction(PredictionCommand),
+    /// Perpetual futures
+    #[command(subcommand)]
+    Perps(PerpsCommand),
 }
 
-#[derive(Debug, Subcommand)]
-pub enum AuthCommand {
-    /// Derive an existing CLOB API key, or create one if none exists.
-    ///
-    /// Requires POLYMARKET_PRIVATE_KEY. The resulting credentials are printed as
-    /// shell exports.
-    Derive,
-
-    /// Show which credentials are configured and validate the CLOB key.
-    Check,
-
-    /// Print the address derived from POLYMARKET_PRIVATE_KEY.
-    Whoami,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Venue {
-    /// Prediction markets (CLOB).
-    Prediction,
-    /// Perpetual futures.
-    Perps,
-    /// Both venues.
     All,
+    Prediction,
+    Perps,
 }
 
-#[derive(Debug, clap::Args)]
+impl Venue {
+    pub fn includes_prediction(self) -> bool {
+        self != Venue::Perps
+    }
+
+    pub fn includes_perps(self) -> bool {
+        self != Venue::Prediction
+    }
+}
+
+#[derive(Args, Debug)]
 pub struct OrdersArgs {
-    /// Venue to query.
+    /// Which venue(s) to query
     #[arg(long, value_enum, default_value_t = Venue::All)]
     pub venue: Venue,
-
-    /// Maximum rows to display per venue.
-    #[arg(long, default_value_t = 100)]
-    pub limit: usize,
-
-    /// Narrow prediction orders to one market condition ID.
-    #[arg(long)]
+    /// Prediction: only orders in this market (condition ID)
+    #[arg(long, value_name = "CONDITION_ID")]
     pub market: Option<String>,
-
-    /// Narrow Perps orders to one instrument ID or symbol (for example BTC-USD).
-    #[arg(long)]
+    /// Perps: only orders on this instrument (e.g. BTC-USD, BTC or numeric ID)
+    #[arg(long, value_name = "SYMBOL")]
     pub instrument: Option<String>,
 }
 
-#[derive(Debug, clap::Args)]
+#[derive(Args, Debug)]
 pub struct PositionsArgs {
-    /// Venue to query.
+    /// Which venue(s) to query
     #[arg(long, value_enum, default_value_t = Venue::All)]
     pub venue: Venue,
-
-    /// Maximum rows to display per venue.
-    #[arg(long, default_value_t = 100)]
-    pub limit: usize,
-
-    /// Prediction-market proxy wallet address. Defaults to POLYMARKET_ADDRESS.
-    #[arg(long)]
-    pub address: Option<String>,
+    /// Prediction: wallet holding the positions (default: PM_WALLET, then PM_ADDRESS)
+    #[arg(long, value_name = "ADDRESS")]
+    pub user: Option<String>,
+    /// Prediction: position lifecycle filter
+    #[arg(long, value_enum, default_value_t = PositionStatus::Open)]
+    pub status: PositionStatus,
 }
 
-#[derive(Debug, Subcommand)]
-pub enum PerpsCommand {
-    /// List tradable Perps instruments.
-    Instruments,
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum PositionStatus {
+    Open,
+    Redeemable,
+    RedeemableLost,
+    Mergeable,
+    Closed,
+}
 
-    /// Show the current ticker for one instrument.
-    Ticker {
-        /// Instrument ID or symbol (for example BTC-USD).
-        instrument: String,
-    },
+impl PositionStatus {
+    pub fn as_api(self) -> &'static str {
+        match self {
+            PositionStatus::Open => "OPEN",
+            PositionStatus::Redeemable => "REDEEMABLE",
+            PositionStatus::RedeemableLost => "REDEEMABLE_LOST",
+            PositionStatus::Mergeable => "MERGEABLE",
+            PositionStatus::Closed => "CLOSED",
+        }
+    }
+}
 
-    /// Inspect or replace position-level take-profit / stop-loss triggers.
-    Tpsl {
-        #[command(subcommand)]
-        command: TpslCommand,
-    },
-
-    /// List active Perps orders.
+#[derive(Subcommand, Debug)]
+pub enum PredictionCommand {
+    /// Your live CLOB orders
     Orders {
-        /// Instrument ID or symbol (for example BTC-USD).
+        /// Only orders in this market (condition ID)
+        #[arg(long, value_name = "CONDITION_ID")]
+        market: Option<String>,
+        /// Only orders on this outcome token (requires --market)
+        #[arg(long, value_name = "TOKEN_ID", requires = "market")]
+        asset_id: Option<String>,
+        /// Every live order on your deposit wallet, whichever signer or API key placed it
         #[arg(long)]
-        instrument: Option<String>,
-
-        /// Maximum rows to display.
-        #[arg(long, default_value_t = 100)]
+        wallet: bool,
+    },
+    /// Your prediction-market positions (Data API v2)
+    Positions {
+        /// Wallet holding the positions (default: PM_WALLET, then PM_ADDRESS)
+        #[arg(long, value_name = "ADDRESS")]
+        user: Option<String>,
+        /// Position lifecycle filter
+        #[arg(long, value_enum, default_value_t = PositionStatus::Open)]
+        status: PositionStatus,
+    },
+    /// Browse markets: top by 24h volume, or full-text search
+    Markets {
+        /// Search text
+        #[arg(long, short)]
+        search: Option<String>,
+        /// Maximum number of markets
+        #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Derive (or create) CLOB API credentials, signing with PM_PRIVATE_KEY
+    ApiKey {
+        /// Create a new API key instead of deriving the existing one
+        #[arg(long)]
+        create: bool,
+        /// Credential nonce
+        #[arg(long, default_value_t = 0)]
+        nonce: u64,
+        /// Append the credentials to this env file (0600) instead of printing them
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
 }
 
-#[derive(Debug, Subcommand)]
-pub enum TpslCommand {
-    /// Show active TP/SL triggers, optionally for one instrument.
-    Show {
-        /// Instrument ID or symbol (for example BTC-USD).
-        #[arg(long)]
+#[derive(Subcommand, Debug)]
+pub enum PerpsCommand {
+    /// Instruments with live mark, index and funding (public)
+    Markets {
+        /// Filter by symbol, base asset or category
+        #[arg(long, short)]
+        search: Option<String>,
+    },
+    /// Your open perps orders, including TP/SL triggers
+    Orders {
+        /// Only this instrument (e.g. BTC-USD, BTC or numeric ID)
+        #[arg(long, value_name = "SYMBOL")]
         instrument: Option<String>,
     },
-
-    /// Create or replace position-level TP/SL triggers.
-    ///
-    /// The Perps API cannot modify a trigger in place, so this cancels the
-    /// existing trigger of a kind and creates a replacement. Positions are
-    /// protected one kind at a time.
-    Set(TpslSetArgs),
+    /// Your perps positions with attached TP/SL and margin summary
+    Positions,
+    /// Create, modify, list or cancel take-profit / stop-loss on a position
+    #[command(subcommand)]
+    Tpsl(TpslCommand),
+    /// Manage Perps proxy (API) credentials
+    #[command(subcommand)]
+    Proxy(ProxyCommand),
 }
 
-#[derive(Debug, clap::Args)]
+#[derive(Subcommand, Debug)]
+pub enum TpslCommand {
+    /// Create or modify take-profit and/or stop-loss on an open position
+    ///
+    /// Triggers watch the mark price and close the whole position with a
+    /// reduce-only market order. An existing trigger of the same kind is
+    /// replaced (cancel, then create), because Perps cannot edit TP/SL in place.
+    #[command(visible_aliases = ["create", "modify"])]
+    Set(TpslSetArgs),
+    /// Cancel take-profit and/or stop-loss on a position
+    Cancel(TpslCancelArgs),
+    /// List take-profit / stop-loss orders
+    List {
+        /// Only this instrument
+        #[arg(long, value_name = "SYMBOL")]
+        instrument: Option<String>,
+    },
+}
+
+#[derive(Args, Debug)]
+#[command(group(ArgGroup::new("trigger").required(true).multiple(true).args(["tp", "sl"])))]
 pub struct TpslSetArgs {
-    /// Instrument ID or symbol (for example BTC-USD).
-    #[arg(long)]
+    /// Instrument with the open position (e.g. BTC-USD, BTC or numeric ID)
     pub instrument: String,
-
-    /// New take-profit trigger price (mark price).
+    /// Take-profit trigger price
+    #[arg(long, value_name = "PRICE")]
+    pub tp: Option<String>,
+    /// Stop-loss trigger price
+    #[arg(long, value_name = "PRICE")]
+    pub sl: Option<String>,
+    /// Keep armed bracket (order-scoped) TP/SL legs instead of replacing them
     #[arg(long)]
-    pub take_profit: Option<String>,
+    pub keep_bracket: bool,
+    #[command(flatten)]
+    pub exec: ExecArgs,
+}
 
-    /// New stop-loss trigger price (mark price).
+#[derive(Args, Debug)]
+pub struct TpslCancelArgs {
+    /// Instrument with the position (e.g. BTC-USD, BTC or numeric ID)
+    pub instrument: String,
+    /// Cancel the take-profit (default: both when neither --tp nor --sl is given)
     #[arg(long)]
-    pub stop_loss: Option<String>,
-
-    /// Remove the existing take-profit trigger without creating a new one.
+    pub tp: bool,
+    /// Cancel the stop-loss
     #[arg(long)]
-    pub clear_take_profit: bool,
-
-    /// Remove the existing stop-loss trigger without creating a new one.
+    pub sl: bool,
+    /// Keep armed bracket (order-scoped) legs; only cancel position triggers
     #[arg(long)]
-    pub clear_stop_loss: bool,
+    pub keep_bracket: bool,
+    #[command(flatten)]
+    pub exec: ExecArgs,
+}
 
-    /// Actually submit cancel/create operations. Without this flag the command
-    /// only prints the plan.
-    #[arg(long, alias = "yes")]
-    pub execute: bool,
+#[derive(Args, Debug, Clone, Copy)]
+pub struct ExecArgs {
+    /// Show the plan and the signed requests without sending anything
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Skip the confirmation prompt
+    #[arg(long, short)]
+    pub yes: bool,
+}
 
-    /// Seconds to wait for canceled triggers to disappear before creating.
-    #[arg(long, default_value_t = 5)]
-    pub wait_secs: u64,
+#[derive(Subcommand, Debug)]
+pub enum ProxyCommand {
+    /// Register a new proxy signer for your Perps account (signed with PM_PRIVATE_KEY)
+    Create {
+        /// Label for this credential
+        #[arg(long, default_value = "pm-cli")]
+        label: String,
+        /// Lifetime in days
+        #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u64).range(1..=365))]
+        days: u64,
+        /// Append the credentials to this env file (0600) instead of printing them
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+    /// Show the Perps account and its proxy keys
+    Show,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn tpsl_set_requires_a_trigger() {
+        assert!(Cli::try_parse_from(["pm", "perps", "tpsl", "set", "BTC-USD"]).is_err());
+        let cli = Cli::try_parse_from([
+            "pm", "perps", "tpsl", "modify", "BTC", "--sl", "60000", "-y",
+        ])
+        .unwrap();
+        let Command::Perps(PerpsCommand::Tpsl(TpslCommand::Set(args))) = cli.command else {
+            panic!("expected tpsl set");
+        };
+        assert_eq!(args.sl.as_deref(), Some("60000"));
+        assert!(args.tp.is_none() && args.exec.yes && !args.exec.dry_run);
+    }
+
+    #[test]
+    fn asset_id_requires_market() {
+        assert!(Cli::try_parse_from(["pm", "prediction", "orders", "--asset-id", "1"]).is_err());
+        assert!(Cli::try_parse_from([
+            "pm",
+            "pred",
+            "orders",
+            "--asset-id",
+            "1",
+            "--market",
+            "0xc"
+        ])
+        .is_ok());
+    }
 }

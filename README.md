@@ -1,270 +1,158 @@
-# polymarket-cli
+# pm-try
 
-`pml` is a small Rust CLI for [Polymarket](https://polymarket.com) that talks to
-both sides of the platform:
+A small Rust CLI (`pm`, built with clap) for Polymarket that:
 
-- **Prediction markets** (CLOB + Data API): list your live orders and open positions.
-- **Perpetuals** (Perps API): list instruments, tickers, positions and live orders,
-  and create or replace position-level **take-profit** and **stop-loss** triggers.
+1. lists your **active orders** on prediction markets and perps,
+2. queries **positions on both prediction markets and perps** (plus public market listings for both),
+3. **creates or modifies take-profit / stop-loss** on an open perps position.
 
-It is built with `clap` for the CLI, `reqwest` for HTTP, and `k256`/`sha3`/`hmac`
-for the two authentication schemes. It does not wrap an SDK: the CLOB L2 HMAC
-signing and the Perps EIP-712-over-MessagePack signing are implemented directly.
+It talks to four Polymarket APIs:
 
-> **Status:** public read paths are exercised against the live APIs. The Perps
-> write path (cancel + create TP/SL) is covered by an end-to-end mock test that
-> verifies request bodies, auth headers and signatures. It has not been run
-> against a funded Perps account from this repository. Start with a dry run.
+| API | Base URL | Used for |
+|---|---|---|
+| CLOB | `https://clob.polymarket.com` | your live prediction orders (L2 HMAC auth), API-key derivation (L1 EIP-712) |
+| Data API v2 | `https://data-api.polymarket.com` | prediction positions |
+| Gamma | `https://gamma-api.polymarket.com` | market questions, market search |
+| Perps | `https://api.perpetuals.polymarket.com` | instruments, tickers, portfolio, open orders, signed TP/SL orders |
 
 ## Build
 
 ```bash
 cargo build --release
-./target/release/pml --help
 ```
 
-Rust 1.80+ is required.
+The binary is `target/release/pm` (or `cargo install --path .` to put `pm` on your `PATH`).
 
-## Commands
+## Credentials
 
-| Command | What it does |
+Everything is configured through `PM_*` environment variables, read from the environment or
+from `./.env` (or `--env-file PATH`). Real environment variables win over the file. Secrets are
+never accepted as command-line flags. Copy [.env.example](.env.example) to `.env` and
+`chmod 600 .env`.
+
+| Variable | Needed for |
 |---|---|
-| `pml orders --venue all` | Live orders from prediction markets and Perps |
-| `pml orders --venue prediction --market 0x...` | Live CLOB orders, optionally filtered by market |
-| `pml orders --venue perps --instrument BTC-USD` | Live Perps orders for one instrument |
-| `pml positions --venue all` | Open prediction positions and Perps positions |
-| `pml positions --venue prediction --address 0x...` | Prediction positions for a proxy wallet |
-| `pml perps instruments` | Tradable Perps instruments |
-| `pml perps ticker BTC-USD` | Mark/index/last/funding for one instrument |
-| `pml perps orders` | Live Perps orders |
-| `pml perps tpsl show [--instrument BTC-USD]` | Active TP/SL triggers |
-| `pml perps tpsl set --instrument BTC-USD --take-profit 70000 --stop-loss 62000` | Preview a TP/SL replacement |
-| `pml perps tpsl set ... --execute` | Cancel old trigger(s) and create replacement(s) |
-| `pml auth derive` | Create/derive CLOB API credentials from `POLYMARKET_PRIVATE_KEY` |
-| `pml auth check` | Show configured credentials and validate the CLOB key |
-| `pml auth whoami` | Print the address derived from `POLYMARKET_PRIVATE_KEY` |
+| `PM_PRIVATE_KEY` | only to create credentials (`pm prediction api-key`, `pm perps proxy create`) |
+| `PM_ADDRESS` | signer address for CLOB requests (derived from `PM_PRIVATE_KEY` if unset) |
+| `PM_WALLET` | the Polymarket wallet that holds your prediction positions (defaults to `PM_ADDRESS`) |
+| `PM_CLOB_API_KEY`, `PM_CLOB_SECRET`, `PM_CLOB_PASSPHRASE` | prediction orders |
+| `PM_PERPS_PROXY`, `PM_PERPS_SECRET` | perps reads (positions, orders) |
+| `PM_PERPS_PROXY_KEY` | signing perps TP/SL orders (the proxy address is derived from it) |
 
-Add `--json` before or after a subcommand for machine-readable output.
-
-`--venue all` requires both credential sets. If you only have one, query
-`--venue prediction` or `--venue perps` separately.
-
-## Configuration
-
-Configuration comes from environment variables (a local `.env` is loaded
-automatically by the binary). Nothing is required for public market data.
-
-### Prediction markets (CLOB)
-
-The CLOB uses two auth layers:
-
-- **L1**: an EIP-712 `ClobAuth` signature made with your wallet key, used only to
-  create or derive API credentials.
-- **L2**: HMAC-SHA256 headers made with the resulting API key, secret and
-  passphrase, used for private reads such as `/data/orders`.
-
-The easiest setup is:
+One-time setup, with `PM_PRIVATE_KEY` set to the EOA that controls your Polymarket account:
 
 ```bash
-export POLYMARKET_PRIVATE_KEY=0x...          # signer key; never commit this
-pml auth derive                              # prints export lines
-eval "$(pml auth derive)"                    # or copy them into your shell/.env
+pm prediction api-key --out .env      # derive CLOB API credentials (add --create if none exist yet)
 ```
-
-`pml auth derive` calls `GET /auth/derive-api-key` and falls back to
-`POST /auth/api-key` when the wallet has no key yet. It prints:
 
 ```bash
-export POLYMARKET_API_KEY='...'
-export POLYMARKET_API_SECRET='...'
-export POLYMARKET_API_PASSPHRASE='...'
-export POLYMARKET_SIGNER_ADDRESS='0x...'
+pm perps proxy create --out .env      # register a Perps proxy signer (7 days by default, --days N)
 ```
 
-You can also supply credentials created elsewhere. For L2 requests the CLI sends
-`POLY_ADDRESS` as the signer address (`POLYMARKET_SIGNER_ADDRESS`, otherwise the
-address derived from `POLYMARKET_PRIVATE_KEY`, otherwise `POLYMARKET_ADDRESS`).
+`--out` writes the variables into the file (created with mode 0600, replacing older values of
+the same variables). Without `--out` they are printed. After that you can drop `PM_PRIVATE_KEY`
+from `.env`: day-to-day commands only need the API credentials and the proxy key.
 
-Prediction **positions** are read from the public Data API and are keyed by the
-wallet that holds them — normally your Polymarket proxy wallet:
+## Usage
+
+### Active orders (prediction + perps)
 
 ```bash
-export POLYMARKET_ADDRESS=0x...   # proxy wallet shown in Polymarket settings
+pm orders                                  # both venues
+pm orders --venue perps --instrument BTC   # one venue, filtered
+pm prediction orders --wallet              # every live order on your deposit wallet
+pm perps orders
 ```
 
-### Perps
+With `--venue all` (the default), a venue without credentials is skipped with a hint instead of
+failing the command.
 
-Perps uses its own proxy credentials, unrelated to the CLOB `POLY_*` headers:
-
-| Variable | Meaning |
-|---|---|
-| `POLYMARKET_PERPS_PROXY` | Proxy signer address |
-| `POLYMARKET_PERPS_SECRET` | Proxy secret returned when the proxy was created |
-| `POLYMARKET_PERPS_PROXY_KEY` | Proxy signer private key, used to sign trading operations |
-
-Private Perps reads use the first two headers. Creating/canceling TP/SL also
-requires the proxy signing key.
-
-These credentials are provisioned by the Perps `CreateProxy` flow. The official
-SDK can create and persist them:
-
-```ts
-import { createSecureClient } from "@polymarket/client";
-import { privateKey } from "@polymarket/client/viem";
-
-const client = await createSecureClient({
-  wallet: process.env.POLYMARKET_WALLET_ADDRESS!,
-  signer: privateKey(process.env.POLYMARKET_PRIVATE_KEY!),
-});
-const session = await client.openPerpsSession();
-console.log(session.credentials);
-// { proxy, privateKey, secret, expiresAt }
-```
-
-Map those values to `POLYMARKET_PERPS_PROXY`, `POLYMARKET_PERPS_PROXY_KEY` and
-`POLYMARKET_PERPS_SECRET`. The proxy key is a separate key; do not use your main
-wallet key unless it actually is the proxy signer.
-
-### All variables
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `POLYMARKET_PRIVATE_KEY` | — | CLOB L1 signer key; also used for `auth derive` |
-| `POLYMARKET_ADDRESS` | — | Proxy wallet for prediction positions |
-| `POLYMARKET_SIGNER_ADDRESS` | derived | Optional `POLY_ADDRESS` override for CLOB L2 |
-| `POLYMARKET_API_KEY` | — | CLOB L2 API key |
-| `POLYMARKET_API_SECRET` | — | CLOB L2 secret (base64url) |
-| `POLYMARKET_API_PASSPHRASE` | — | CLOB L2 passphrase |
-| `POLYMARKET_PERPS_PROXY` | — | Perps proxy address |
-| `POLYMARKET_PERPS_SECRET` | — | Perps proxy secret |
-| `POLYMARKET_PERPS_PROXY_KEY` | — | Perps proxy signing key |
-| `POLYMARKET_CLOB_URL` | `https://clob.polymarket.com` | CLOB base URL |
-| `POLYMARKET_PERPS_URL` | `https://api.perpetuals.polymarket.com` | Perps base URL |
-| `POLYMARKET_DATA_API_URL` | `https://data-api.polymarket.com` | Data API base URL |
-| `POLYMARKET_CHAIN_ID` | `137` | EIP-712 chain ID |
-| `POLYMARKET_TIMEOUT_SECS` | `30` | HTTP timeout |
-
-The same URLs can be overridden with `--clob-url`, `--perps-url` and
-`--data-api-url`.
-
-## Examples
+### Positions and markets (prediction + perps)
 
 ```bash
-# Both venues, live orders
-pml orders --venue all
-
-# Prediction positions for a proxy wallet
-pml positions --venue prediction --address 0x1111111111111111111111111111111111111111
-
-# Perps market data
-pml perps instruments
-pml perps ticker BTC-USD          # BTC-PERP is accepted as an alias too
-
-# Inspect existing position TP/SL
-pml perps tpsl show --instrument BTC-USD
-
-# Preview a replacement (no network mutation)
-pml perps tpsl set \
-  --instrument BTC-USD \
-  --take-profit 70000 \
-  --stop-loss 62000
-
-# Apply it
-pml perps tpsl set \
-  --instrument BTC-USD \
-  --take-profit 70000 \
-  --stop-loss 62000 \
-  --execute
-
-# Remove both triggers
-pml perps tpsl set --instrument BTC-USD --clear-take-profit --clear-stop-loss --execute
-
-# JSON
-pml orders --venue all --json
+pm positions                        # prediction (Data API) + perps (portfolio, mark, attached TP/SL)
+pm positions --venue prediction --status redeemable
+pm perps positions
+pm perps markets --search btc       # instruments with mark / index / funding (no credentials needed)
+pm prediction markets --search "fed rates"   # or omit --search for the top markets by 24h volume
 ```
 
-A dry run prints the instrument, position side/size, mark price, and the existing
-triggers that would be canceled. `--execute` is required to submit anything.
+### Take-profit / stop-loss on a perps position
 
-## How TP/SL replacement works
+```bash
+pm perps tpsl set BTC --tp 71000 --sl 59500              # create or modify; asks for confirmation
+pm perps tpsl set BTC-USD --sl 60500 --dry-run           # show the plan and signed requests only
+pm perps tpsl modify ETH --tp 2300 --yes                 # aliases: create, modify; --yes skips the prompt
+pm perps tpsl cancel BTC --sl                            # cancel just the stop-loss (default: both)
+pm perps tpsl list
+```
 
-Position-level TP/SL triggers close the **full position** at trigger time, using
-the **mark price**, and use a market exit. The Perps API allows at most one
-position take-profit and one position stop-loss per instrument.
+Example plan:
 
-The API cannot modify a trigger in place: changing a price means canceling the
-old trigger and creating a new one. `pml perps tpsl set` therefore:
+```
+BTC-USD: LONG 0.02 @ 62000 (liquidation 50120.5)
+Mark price: 63417.4
+  cancel  take-profit @ 69000 (position, #111)
+  cancel  stop-loss @ 58000 (armed bracket leg, #222)
+  create  take-profit @ 71000 (whole position, market exit)
+  create  stop-loss @ 59500 (whole position, market exit)
+TP/SL cannot be edited in place: old triggers are cancelled first, then replaced.
+Send these orders? [y/N]
+```
 
-1. Resolves the instrument and requires an open position.
-2. Validates each new trigger against the current mark:
-   - long: TP above mark, SL below mark;
-   - short: TP below mark, SL above mark.
-3. Finds existing TP/SL orders of the affected kind for that instrument,
-   including order-scoped (bracket) triggers.
-4. Processes take-profit first, then stop-loss. For each kind it cancels the old
-   trigger(s), waits until they disappear from open orders, then creates the
-   replacement. The other kind stays active while this happens.
-5. Refuses to create a replacement if a cancellation is not acknowledged or the
-   old order is still visible.
+How it works:
 
-Important caveats:
+* Triggers are **position-scoped**: they watch the **mark price** and close the **whole position**
+  with a reduce-only market order when hit (`grp: "position"`, `qty: "0"`, `tr.market: true`).
+  The closing side is derived from the position: sell for a long, buy for a short.
+* Perps **cannot edit TP/SL in place**. To modify one, `pm` cancels the existing trigger of that
+  kind and then creates the replacement, as the Perps docs prescribe. The two steps are not atomic.
+  If the replacement is rejected after the cancel, `pm` says so loudly, because the position is
+  then unprotected for that kind. A trigger already at the requested price is left alone.
+* **Armed bracket legs** (TP/SL attached to an entry order that has already filled) are replaced
+  by default, as the docs recommend. Pass `--keep-bracket` to leave them. **Dormant** bracket legs,
+  whose entry order is still resting, are never touched.
+* Checks run before anything is sent: an open position must exist; the take-profit must be above
+  the mark for a long (below for a short) and the stop-loss on the other side, because a trigger
+  the mark has already crossed would fire immediately and the exchange rejects it; price
+  decimals and the 5-significant-figure rule are enforced; and you get a warning when a stop sits
+  beyond the liquidation price.
+* Nothing is sent without confirmation. Without a terminal, `--yes` is required.
 
-- **Cancel-then-create is not atomic.** If creation fails after a cancel, that
-  kind is unprotected; the error says so. The other kind is left intact.
-- Canceling an order-scoped trigger attached to a still-resting bracket entry
-  does not cancel the entry. This command only manages triggers; it does not
-  place or cancel entry orders.
-- The exchange itself rejects triggers already crossed by the mark; the CLI
-  rejects them earlier so it does not cancel a working trigger first.
-- Perps order placement is geographically restricted. Check the
-  [Perps restrictions](https://docs.polymarket.com/api-reference/perps/geographic-restrictions)
-  before using this against a live account.
+`--json` works on every command and prints machine-readable output to stdout.
 
-## APIs used
+## Signing details
 
-| Purpose | Request | Auth |
-|---|---|---|
-| CLOB live orders | `GET /data/orders` | L2 HMAC headers |
-| Derive/create CLOB key | `GET /auth/derive-api-key`, `POST /auth/api-key` | L1 EIP-712 `ClobAuth` |
-| Prediction positions | `GET /v2/positions` (Data API) | Public |
-| Perps instruments/tickers | `GET /v1/info/instruments`, `GET /v1/info/tickers` | Public |
-| Perps portfolio | `GET /v1/account/portfolio` | `polymarket-proxy`, `polymarket-secret` |
-| Perps open orders | `GET /v1/account/open-orders` | `polymarket-proxy`, `polymarket-secret` |
-| Create TP/SL | `POST /v1/trade/orders` with `createOrders`, `grp: "position"` | EIP-712 `Op` |
-| Cancel TP/SL | `DELETE /v1/trade/orders` with `cancelOrders` | EIP-712 `Op` |
+* **CLOB L1**: EIP-712 `ClobAuth(address address,string timestamp,uint256 nonce,string message)`
+  in domain `ClobAuthDomain`/`1`/137, sent as `POLY_ADDRESS/SIGNATURE/TIMESTAMP/NONCE`.
+* **CLOB L2**: `urlsafe_b64(HMAC_SHA256(b64decode(secret), ts + METHOD + path + body))`. The
+  query string is not part of the signed path.
+* **Perps trading**: the operation is reduced to the SDK's compact positional form, e.g.
+  `["createOrders", [[iid, buy, qty, po, ro, [market, trp, "tp"]]], "position"]`, then
+  MessagePack-encoded and hashed with keccak256. The resulting `data` hash is signed by the
+  proxy key as EIP-712 `Op(bytes32 data,uint64 salt,uint64 ts)` in domain `Polymarket`/`1`/137.
+  The JSON body sent alongside describes the same operation.
+* **Perps proxy registration**: the owner signs EIP-712 `CreateProxy(address addr,uint64 exp,uint64 salt,uint64 ts)`.
 
-References:
-
-- [Perps overview](https://docs.polymarket.com/api-reference/perps/overview)
-- [Perps trading / TP-SL](https://docs.polymarket.com/perps/trading)
-- [Perps authenticated sessions](https://docs.polymarket.com/perps/authenticated-sessions)
-- [CLOB open orders](https://docs.polymarket.com/api-reference/trade/get-user-orders)
-- [CLOB authentication](https://github.com/dilettante-trading/polyoxide/blob/main/docs/specs/clob/auth.md)
-
-## Testing
+## Tests
 
 ```bash
 cargo test
-cargo clippy --all-targets -- -D warnings
 ```
 
-The test suite includes:
-
-- reference vectors for the Perps EIP-712 signature and the exact MessagePack
-  bytes of a `createOrders`/position operation, generated with `viem` and
-  `@msgpack/msgpack` (the same libraries used by the official TypeScript SDK);
-- a CLOB test that serves paginated orders from a mock server and recomputes the
-  HMAC from each request's timestamp, method, path and query;
-- an end-to-end Perps TP/SL replacement test against a mock server, asserting the
-  cancel/create ordering, auth headers, request bodies and signatures;
-- validation tests that a crossed trigger is rejected before any mutation.
+* Unit tests include known-answer vectors from Polymarket's reference client (HMAC and the
+  `ClobAuth` EIP-712 signature), byte-level MessagePack checks for the Perps compact operations,
+  and the TP/SL planner.
+* `tests/e2e.rs` runs the real `pm` binary against a local mock of the APIs. It checks that
+  `tpsl set` cancels before it creates, that every request body matches its signed operation and
+  recovers to the proxy address, that nothing is sent on `--dry-run` or without `--yes`, plus
+  the failure reporting, CLOB L2 auth headers and pagination for every listing.
 
 ## Limitations
 
-This crate is intentionally scoped to account queries and Perps TP/SL. It does
-not place prediction-market orders, Perps entry orders, withdrawals or transfers.
-It is not financial advice; use test-sized amounts first.
-
-## License
-
-MIT
+* The private endpoints (orders, portfolio, TP/SL submission, credential creation) were
+  verified against the documented formats and a mock server, not against a live account.
+  Try `--dry-run` and a small position first.
+* Perps order placement is not available in some jurisdictions; see Polymarket's geographic
+  restrictions.
+* Only market-exit, whole-position TP/SL is supported. Partial-size and trailing stops are not.

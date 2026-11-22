@@ -1,11 +1,16 @@
-//! Polymarket prediction-market and perpetual-futures CLI library.
+//! Small Polymarket client library behind the `pm` CLI.
+//!
+//! | Module | API | Used for |
+//! |---|---|---|
+//! | [`clob`] | CLOB (`clob.polymarket.com`) | L1/L2 auth, live prediction orders |
+//! | [`data_api`] | Data API v2 | prediction positions |
+//! | [`gamma`] | Gamma | market questions, search |
+//! | [`perps`] | Perps (`api.perpetuals.polymarket.com`) | instruments, portfolio, orders, signed TP/SL |
 
-pub mod auth;
-pub mod cli;
 pub mod clob;
-pub mod commands;
 pub mod config;
-pub mod msgpack;
+pub mod data_api;
+pub mod eth;
+pub mod gamma;
+pub mod http;
 pub mod perps;
-pub mod render;
-pub mod tpsl;

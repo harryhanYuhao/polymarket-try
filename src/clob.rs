@@ -1,342 +1,406 @@
-//! Prediction-market clients: CLOB private orders and the public Data API.
+//! Prediction-market CLOB API (`clob.polymarket.com`).
+//!
+//! * L1 auth: an EIP-712 `ClobAuth` signature by the account's EOA, used to
+//!   create or derive API credentials.
+//! * L2 auth: HMAC-SHA256 over `timestamp + METHOD + path [+ body]` with the
+//!   API secret, used for private reads such as open orders.
 
-use anyhow::{bail, Context, Result};
-use reqwest::Url;
-use serde::de::DeserializeOwned;
+use crate::config::ClobCredentials;
+use crate::eth::{domain_separator, typed_data_digest, word_address, word_u64, LocalSigner};
+use crate::http::{de, now_secs, read_json, MAX_PAGES};
+use alloy_primitives::{keccak256, Address, B256};
+use anyhow::{Context, Result};
+use base64::engine::general_purpose::URL_SAFE;
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+use base64::{alphabet, Engine as _};
+use hmac::{Hmac, Mac};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use sha2::Sha256;
 
-use crate::auth::{
-    current_timestamp_seconds, l1_headers, l2_headers, Address, ApiCredentials, SecretKey,
-};
+const CLOB_AUTH_DOMAIN: &str = "ClobAuthDomain";
+const CLOB_AUTH_MESSAGE: &str = "This message attests that I control the given wallet";
+/// `next_cursor` value the CLOB returns on the last page (base64 of "-1").
+const END_CURSOR: &str = "LTE=";
 
-const MAX_PAGES: usize = 1_000;
-
-fn body_snippet(bytes: &[u8]) -> String {
-    const LIMIT: usize = 500;
-    let text = String::from_utf8_lossy(bytes);
-    if text.chars().count() <= LIMIT {
-        text.into_owned()
-    } else {
-        let shortened: String = text.chars().take(LIMIT).collect();
-        format!("{shortened}…")
-    }
-}
-
-fn request_path(url: &Url) -> String {
-    match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_owned(),
-    }
-}
-
-async fn read_json<T: DeserializeOwned>(response: reqwest::Response, label: &str) -> Result<T> {
-    let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .with_context(|| format!("failed to read response body from {label}"))?;
-    if !status.is_success() {
-        bail!("{label} returned HTTP {status}: {}", body_snippet(&bytes));
-    }
-    serde_json::from_slice(&bytes).with_context(|| format!("unexpected JSON response from {label}"))
-}
-
-// ---------------------------------------------------------------------------
-// CLOB
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct OpenOrder {
+/// A live order as returned by `GET /data/orders` or `GET /data/wallet-open-orders`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClobOrder {
     pub id: String,
-    pub status: String,
-    pub owner: String,
-    pub maker_address: String,
-    pub market: String,
-    pub asset_id: String,
-    pub side: String,
-    pub original_size: String,
-    pub size_matched: String,
-    pub price: String,
-    pub outcome: String,
-    pub expiration: String,
-    pub order_type: String,
-    pub created_at: i64,
     #[serde(default)]
-    pub associate_trades: Vec<String>,
+    pub status: String,
+    /// Market condition ID.
+    #[serde(default)]
+    pub market: String,
+    /// Outcome token ID.
+    #[serde(default)]
+    pub asset_id: String,
+    #[serde(default)]
+    pub side: String,
+    #[serde(default, deserialize_with = "de::string_any")]
+    pub price: String,
+    #[serde(default, deserialize_with = "de::string_any")]
+    pub original_size: String,
+    #[serde(default, deserialize_with = "de::string_any")]
+    pub size_matched: String,
+    #[serde(default)]
+    pub outcome: Option<String>,
+    #[serde(default)]
+    pub order_type: Option<String>,
+    #[serde(default, deserialize_with = "de::opt_string_any")]
+    pub expiration: Option<String>,
+    #[serde(default, deserialize_with = "de::opt_string_any")]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub maker_address: Option<String>,
+    /// Market question, filled in from the Gamma API when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OrdersPage {
-    data: Vec<OpenOrder>,
-    next_cursor: String,
-}
-
-#[derive(Clone)]
-pub struct ClobClient {
-    http: reqwest::Client,
-    base: Url,
-    address: Address,
-    credentials: ApiCredentials,
-}
-
-impl ClobClient {
-    pub fn new(
-        http: reqwest::Client,
-        base_url: &str,
-        address: Address,
-        credentials: ApiCredentials,
-    ) -> Result<Self> {
-        let base = Url::parse(base_url).with_context(|| "invalid CLOB base URL")?;
-        Ok(Self {
-            http,
-            base,
-            address,
-            credentials,
-        })
-    }
-
-    fn url(&self, path: &str) -> Result<Url> {
-        self.base
-            .join(path)
-            .with_context(|| format!("invalid CLOB URL path {path}"))
-    }
-
-    async fn get_signed<T: DeserializeOwned>(&self, url: Url) -> Result<T> {
-        let path = request_path(&url);
-        let headers = l2_headers(
-            self.address,
-            &self.credentials,
-            current_timestamp_seconds(),
-            "GET",
-            &path,
-            &[],
-        )?;
-        let mut request = self.http.get(url.clone());
-        for (name, value) in headers {
-            request = request.header(name, value);
-        }
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("GET {url} failed"))?;
-        read_json::<T>(response, &format!("GET {url}")).await
-    }
-
-    /// Returns every live order for the authenticated account.
-    pub async fn open_orders(&self, market: Option<&str>) -> Result<Vec<OpenOrder>> {
-        let mut cursor: Option<String> = None;
-        let mut orders = Vec::new();
-        for _ in 0..MAX_PAGES {
-            let mut url = self.url("/data/orders")?;
-            {
-                let mut query = url.query_pairs_mut();
-                if let Some(market) = market {
-                    query.append_pair("market", market);
-                }
-                if let Some(cursor) = cursor.as_deref() {
-                    query.append_pair("next_cursor", cursor);
-                }
-            }
-            let page: OrdersPage = self.get_signed(url).await?;
-            let next = page.next_cursor.trim().to_owned();
-            let previous = cursor.clone();
-            orders.extend(page.data);
-            if next.is_empty() {
-                return Ok(orders);
-            }
-            if previous.as_deref() == Some(next.as_str()) {
-                bail!("CLOB order pagination repeated cursor {next:?}");
-            }
-            cursor = Some(next);
-        }
-        bail!("CLOB order pagination exceeded {MAX_PAGES} pages")
-    }
-}
-
-/// Derives an existing CLOB API key, creating one when the wallet has none.
-pub async fn create_or_derive_credentials(
-    http: &reqwest::Client,
-    base_url: &str,
-    signer: &SecretKey,
-    chain_id: u64,
-) -> Result<ApiCredentials> {
-    let base = Url::parse(base_url).with_context(|| "invalid CLOB base URL")?;
-    let derive_url = base
-        .join("/auth/derive-api-key")
-        .context("invalid CLOB credential URL")?;
-    let create_url = base
-        .join("/auth/api-key")
-        .context("invalid CLOB credential URL")?;
-
-    let derive_response = request_with_l1(http.get(derive_url.clone()), signer, chain_id)?
-        .send()
-        .await
-        .with_context(|| format!("GET {derive_url} failed"))?;
-    let derive_status = derive_response.status();
-    let derive_body = derive_response
-        .bytes()
-        .await
-        .context("failed to read CLOB derive response")?;
-    if derive_status.is_success() {
-        return serde_json::from_slice(&derive_body)
-            .context("unexpected CLOB derive-credentials response");
-    }
-
-    // A missing key is reported as 400/404. Authentication failures are not
-    // fixed by creating a new key, so surface them directly.
-    if derive_status != reqwest::StatusCode::NOT_FOUND
-        && derive_status != reqwest::StatusCode::BAD_REQUEST
-    {
-        bail!(
-            "GET {derive_url} returned HTTP {derive_status}: {}",
-            body_snippet(&derive_body)
-        );
-    }
-
-    let create_response = request_with_l1(http.post(create_url.clone()), signer, chain_id)?
-        .send()
-        .await
-        .with_context(|| format!("POST {create_url} failed"))?;
-    let create_status = create_response.status();
-    let create_body = create_response
-        .bytes()
-        .await
-        .context("failed to read CLOB create response")?;
-    if !create_status.is_success() {
-        bail!(
-            "could not derive or create CLOB API credentials (derive HTTP {derive_status}: {}; \
-             create HTTP {create_status}: {})",
-            body_snippet(&derive_body),
-            body_snippet(&create_body)
-        );
-    }
-    serde_json::from_slice(&create_body).context("unexpected CLOB create-credentials response")
-}
-
-fn request_with_l1(
-    request: reqwest::RequestBuilder,
-    signer: &SecretKey,
-    chain_id: u64,
-) -> Result<reqwest::RequestBuilder> {
-    let headers = l1_headers(signer, chain_id, 0)?;
-    let mut request = request;
-    for (name, value) in headers {
-        request = request.header(name, value);
-    }
-    Ok(request)
-}
-
-// ---------------------------------------------------------------------------
-// Data API (public prediction-market positions)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PredictionPosition {
-    pub proxy_wallet: String,
-    pub token_id: String,
-    pub condition_id: String,
-    pub current_size: f64,
-    pub avg_price: f64,
-    pub entry_cost_usdc: f64,
-    pub current_price: f64,
-    pub current_value: f64,
-    pub total_size: f64,
-    pub realized_pnl: f64,
-    pub unrealized_pnl: f64,
-    pub total_pnl: f64,
-    pub percent_pnl: f64,
-    pub status: String,
-    pub redeemable: bool,
-    pub mergeable: bool,
-    pub negative_risk: bool,
-    pub title: String,
-    pub slug: String,
-    pub outcome: String,
-    pub end_date: String,
-    pub event_slug: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct PositionsPage {
-    data: Vec<PredictionPosition>,
-    pagination: DataPagination,
-}
-
-#[derive(Debug, Deserialize)]
-struct DataPagination {
+    #[serde(default)]
+    data: Vec<ClobOrder>,
     #[serde(default)]
     next_cursor: Option<String>,
 }
 
-#[derive(Clone)]
-pub struct DataApiClient {
-    http: reqwest::Client,
-    base: Url,
+/// CLOB API credentials returned by `/auth/api-key` and `/auth/derive-api-key`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ApiKeyCredentials {
+    #[serde(rename = "apiKey")]
+    pub api_key: String,
+    pub secret: String,
+    pub passphrase: String,
 }
 
-impl DataApiClient {
-    pub fn new(http: reqwest::Client, base_url: &str) -> Result<Self> {
-        let base = Url::parse(base_url).with_context(|| "invalid Data API base URL")?;
-        Ok(Self { http, base })
+#[derive(Debug, Default, Clone)]
+pub struct OrderFilter {
+    /// Condition ID.
+    pub market: Option<String>,
+    /// Outcome token ID (the CLOB requires `market` alongside it).
+    pub asset_id: Option<String>,
+}
+
+pub struct ClobClient {
+    http: reqwest::Client,
+    base_url: String,
+    chain_id: u64,
+}
+
+impl ClobClient {
+    pub fn new(http: reqwest::Client, base_url: impl Into<String>, chain_id: u64) -> Self {
+        Self {
+            http,
+            base_url: base_url.into(),
+            chain_id,
+        }
     }
 
-    pub async fn positions(&self, user: Address, limit: usize) -> Result<Vec<PredictionPosition>> {
-        let mut positions = Vec::new();
+    /// Live orders of the API key's account (`GET /data/orders`), all pages.
+    pub async fn open_orders(
+        &self,
+        creds: &ClobCredentials,
+        filter: &OrderFilter,
+    ) -> Result<Vec<ClobOrder>> {
+        self.paginate(creds, "/data/orders", "next_cursor", filter)
+            .await
+    }
+
+    /// Every live order on the caller's deposit wallet regardless of which
+    /// signer or API key placed it (`GET /data/wallet-open-orders`).
+    pub async fn wallet_open_orders(
+        &self,
+        creds: &ClobCredentials,
+        filter: &OrderFilter,
+    ) -> Result<Vec<ClobOrder>> {
+        self.paginate(creds, "/data/wallet-open-orders", "cursor", filter)
+            .await
+    }
+
+    async fn paginate(
+        &self,
+        creds: &ClobCredentials,
+        path: &str,
+        cursor_param: &str,
+        filter: &OrderFilter,
+    ) -> Result<Vec<ClobOrder>> {
+        let mut orders = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..MAX_PAGES {
-            if positions.len() >= limit {
-                break;
+            let mut query: Vec<(&str, String)> = Vec::new();
+            if let Some(market) = &filter.market {
+                query.push(("market", market.clone()));
             }
-            let mut url = self
-                .base
-                .join("/v2/positions")
-                .context("invalid Data API positions URL")?;
-            {
-                let page_size = limit.saturating_sub(positions.len()).clamp(1, 500);
-                let mut query = url.query_pairs_mut();
-                query.append_pair("user", &user.to_string());
-                query.append_pair("status", "OPEN");
-                query.append_pair("limit", &page_size.to_string());
-                if let Some(cursor) = cursor.as_deref() {
-                    query.append_pair("cursor", cursor);
-                }
+            if let Some(asset) = &filter.asset_id {
+                query.push(("asset_id", asset.clone()));
             }
+            if let Some(c) = &cursor {
+                query.push((cursor_param, c.clone()));
+            }
+            // Query parameters are not part of the signed path.
+            let headers = l2_headers(creds, now_secs(), "GET", path, None)?;
             let response = self
                 .http
-                .get(url.clone())
+                .get(format!("{}{}", self.base_url, path))
+                .query(&query)
+                .headers(headers)
                 .send()
                 .await
-                .with_context(|| format!("GET {url} failed"))?;
-            let page: PositionsPage =
-                read_json::<PositionsPage>(response, &format!("GET {url}")).await?;
-            positions.extend(page.data);
-            let next = page.pagination.next_cursor.unwrap_or_default();
-            if next.is_empty() {
-                break;
+                .with_context(|| format!("GET {path}"))?;
+            let page: OrdersPage = read_json("CLOB", response).await?;
+            orders.extend(page.data);
+            match page.next_cursor {
+                Some(next)
+                    if !next.is_empty()
+                        && next != END_CURSOR
+                        && cursor.as_deref() != Some(next.as_str()) =>
+                {
+                    cursor = Some(next);
+                }
+                _ => break,
             }
-            if cursor.as_deref() == Some(next.as_str()) {
-                bail!("Data API position pagination repeated cursor {next:?}");
-            }
-            cursor = Some(next);
         }
-        positions.truncate(limit);
-        Ok(positions)
+        Ok(orders)
     }
+
+    /// Derive the existing API credentials for `nonce` (L1-authenticated).
+    pub async fn derive_api_key(
+        &self,
+        signer: &LocalSigner,
+        nonce: u64,
+    ) -> Result<ApiKeyCredentials> {
+        let headers = l1_headers(signer, self.chain_id, now_secs(), nonce)?;
+        let response = self
+            .http
+            .get(format!("{}/auth/derive-api-key", self.base_url))
+            .headers(headers)
+            .send()
+            .await?;
+        read_json("CLOB", response).await
+    }
+
+    /// Create new API credentials for `nonce` (L1-authenticated).
+    pub async fn create_api_key(
+        &self,
+        signer: &LocalSigner,
+        nonce: u64,
+    ) -> Result<ApiKeyCredentials> {
+        let headers = l1_headers(signer, self.chain_id, now_secs(), nonce)?;
+        let response = self
+            .http
+            .post(format!("{}/auth/api-key", self.base_url))
+            .headers(headers)
+            .send()
+            .await?;
+        read_json("CLOB", response).await
+    }
+}
+
+/// EIP-712 digest of
+/// `ClobAuth(address address,string timestamp,uint256 nonce,string message)`
+/// in the `ClobAuthDomain` domain.
+pub fn clob_auth_digest(address: &Address, timestamp: u64, nonce: u64, chain_id: u64) -> B256 {
+    let type_hash =
+        keccak256(b"ClobAuth(address address,string timestamp,uint256 nonce,string message)");
+    let mut encoded = Vec::with_capacity(32 * 5);
+    encoded.extend_from_slice(type_hash.as_slice());
+    encoded.extend_from_slice(&word_address(address));
+    encoded.extend_from_slice(keccak256(timestamp.to_string().as_bytes()).as_slice());
+    encoded.extend_from_slice(&word_u64(nonce));
+    encoded.extend_from_slice(keccak256(CLOB_AUTH_MESSAGE.as_bytes()).as_slice());
+    typed_data_digest(
+        &domain_separator(CLOB_AUTH_DOMAIN, "1", chain_id),
+        &keccak256(&encoded),
+    )
+}
+
+/// Level-1 headers proving control of the signer address.
+pub fn l1_headers(
+    signer: &LocalSigner,
+    chain_id: u64,
+    timestamp: u64,
+    nonce: u64,
+) -> Result<HeaderMap> {
+    let digest = clob_auth_digest(&signer.address(), timestamp, nonce, chain_id);
+    let signature = signer.sign_digest_hex(&digest)?;
+    headers(&[
+        ("POLY_ADDRESS", signer.address().to_string()),
+        ("POLY_SIGNATURE", signature),
+        ("POLY_TIMESTAMP", timestamp.to_string()),
+        ("POLY_NONCE", nonce.to_string()),
+    ])
+}
+
+/// Level-2 headers for an API-key-authenticated request.
+pub fn l2_headers(
+    creds: &ClobCredentials,
+    timestamp: u64,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<HeaderMap> {
+    let timestamp = timestamp.to_string();
+    let signature = l2_signature(&creds.secret, &timestamp, method, path, body)?;
+    headers(&[
+        ("POLY_ADDRESS", creds.address.to_string()),
+        ("POLY_SIGNATURE", signature),
+        ("POLY_TIMESTAMP", timestamp),
+        ("POLY_API_KEY", creds.api_key.clone()),
+        ("POLY_PASSPHRASE", creds.passphrase.clone()),
+    ])
+}
+
+/// `urlsafe_base64(HMAC_SHA256(base64_decode(secret), ts + METHOD + path + body))`.
+pub fn l2_signature(
+    secret: &str,
+    timestamp: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<String> {
+    let key = decode_secret(secret)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&key).expect("HMAC accepts keys of any length");
+    mac.update(timestamp.as_bytes());
+    mac.update(method.as_bytes());
+    mac.update(path.as_bytes());
+    if let Some(body) = body {
+        mac.update(body.as_bytes());
+    }
+    Ok(URL_SAFE.encode(mac.finalize().into_bytes()))
+}
+
+/// Secrets are URL-safe base64; accept the standard alphabet and missing
+/// padding too, like the reference Python client does.
+fn decode_secret(secret: &str) -> Result<Vec<u8>> {
+    let normalized: String = secret
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            other => other,
+        })
+        .collect();
+    let engine = GeneralPurpose::new(
+        &alphabet::URL_SAFE,
+        GeneralPurposeConfig::new()
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+            .with_decode_allow_trailing_bits(true),
+    );
+    engine
+        .decode(normalized.as_bytes())
+        .context("PM_CLOB_SECRET is not valid base64")
+}
+
+/// Header names are case-insensitive; `from_bytes` stores them lowercased.
+fn headers(pairs: &[(&str, String)]) -> Result<HeaderMap> {
+    let mut map = HeaderMap::new();
+    for (name, value) in pairs {
+        map.insert(
+            HeaderName::from_bytes(name.as_bytes())?,
+            HeaderValue::from_str(value).with_context(|| format!("invalid {name} header value"))?,
+        );
+    }
+    Ok(map)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const DEV_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    /// Known-answer vector from Polymarket's py-clob-client test suite.
     #[test]
-    fn request_path_includes_query() {
-        let url = Url::parse("https://clob.polymarket.com/data/orders?next_cursor=abc%3D").unwrap();
-        assert_eq!(request_path(&url), "/data/orders?next_cursor=abc%3D");
+    fn hmac_matches_reference_client() {
+        let sig = l2_signature(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "1000000",
+            "test-sign",
+            "/orders",
+            Some(r#"{"hash": "0x123"}"#),
+        )
+        .unwrap();
+        assert_eq!(sig, "ZwAdJKvoYRlEKDkNMwd5BuwNNtg93kNaR_oU2HrfVvc=");
     }
 
     #[test]
-    fn request_path_without_query() {
-        let url = Url::parse("https://clob.polymarket.com/data/orders").unwrap();
-        assert_eq!(request_path(&url), "/data/orders");
+    fn secret_decoding_is_lenient_about_alphabet_and_padding() {
+        let padded = l2_signature(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "1",
+            "GET",
+            "/x",
+            None,
+        )
+        .unwrap();
+        let unpadded = l2_signature(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "1",
+            "GET",
+            "/x",
+            None,
+        )
+        .unwrap();
+        assert_eq!(padded, unpadded);
+        // '+' / '/' (standard alphabet) decode the same as '-' / '_'.
+        let std_alpha = l2_signature("ab+/", "1", "GET", "/x", None).unwrap();
+        let url_alpha = l2_signature("ab-_", "1", "GET", "/x", None).unwrap();
+        assert_eq!(std_alpha, url_alpha);
+        assert!(l2_signature("!!!notbase64!!!", "1", "GET", "/x", None).is_err());
+    }
+
+    /// Known-answer vector from py-clob-client: Amoy (80002), ts 10000000, nonce 23.
+    #[test]
+    fn clob_auth_signature_matches_reference_client() {
+        let signer = LocalSigner::from_hex(DEV_KEY).unwrap();
+        let digest = clob_auth_digest(&signer.address(), 10_000_000, 23, 80_002);
+        assert_eq!(
+            signer.sign_digest_hex(&digest).unwrap(),
+            "0xf62319a987514da40e57e2f4d7529f7bac38f0355bd88bb5adbb3768d80de6c1682518e0af677d5260366425f4361e7b70c25ae232aff0ab2331e2b164a1aedc1b"
+        );
+    }
+
+    #[test]
+    fn l2_headers_are_complete() {
+        let creds = ClobCredentials {
+            address: LocalSigner::from_hex(DEV_KEY).unwrap().address(),
+            api_key: "key".into(),
+            secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            passphrase: "pass".into(),
+        };
+        let h = l2_headers(&creds, 1_700_000_000, "GET", "/data/orders", None).unwrap();
+        assert_eq!(
+            h["poly_address"],
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+        );
+        assert_eq!(h["poly_timestamp"], "1700000000");
+        assert_eq!(h["poly_api_key"], "key");
+        assert_eq!(h["poly_passphrase"], "pass");
+        let expected =
+            l2_signature(&creds.secret, "1700000000", "GET", "/data/orders", None).unwrap();
+        assert_eq!(h["poly_signature"], expected.as_str());
+    }
+
+    #[test]
+    fn parses_order_page_with_numeric_fields() {
+        let page: OrdersPage = serde_json::from_str(
+            r#"{"limit":100,"next_cursor":"LTE=","count":1,"data":[{
+                "id":"0xabc","status":"LIVE","owner":"o","maker_address":"0x1",
+                "market":"0xm","asset_id":"123","side":"BUY","original_size":"100",
+                "size_matched":"0","price":"0.5","outcome":"YES","expiration":"0",
+                "order_type":"GTC","created_at":1700000000,"associate_trades":[]}]}"#,
+        )
+        .unwrap();
+        let order = &page.data[0];
+        assert_eq!(order.created_at.as_deref(), Some("1700000000"));
+        assert_eq!(order.price, "0.5");
+        assert!(order.extra.contains_key("associate_trades"));
+        assert_eq!(page.next_cursor.as_deref(), Some(END_CURSOR));
     }
 }
